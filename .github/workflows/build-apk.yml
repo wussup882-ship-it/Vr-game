@@ -258,34 +258,53 @@ jobs:
           ls addons/godotopenxrvendors
 
       - name: Set up Godot, Android SDK and debug keystore
+        shell: bash
         run: |
-          mkdir -p ~/.local/share/godot/export_templates ~/.config/godot
-          mv /root/.local/share/godot/export_templates/${GODOT_VERSION}.stable ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          set -eE
+          trap 'echo "::error::setup failed at: $BASH_COMMAND"' ERR
+          DEST="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          SRC=$(find / -maxdepth 7 -type d -name "${GODOT_VERSION}.stable" -path "*export_templates*" 2>/dev/null | head -1)
+          echo "templates: $SRC -> $DEST"
+          mkdir -p "$HOME/.local/share/godot/export_templates" "$HOME/.config/godot"
+          if [ "$SRC" != "$DEST" ]; then rm -rf "$DEST"; cp -r "$SRC" "$DEST"; fi
+          rm -f /root/debug.keystore
           keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android -keystore /root/debug.keystore -storepass android -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
-          cat > ~/.config/godot/editor_settings-4.4.tres <<'EOF'
+          JAVA_DIR=$(dirname "$(dirname "$(readlink -f "$(which java)")")")
+          SDK_DIR=/usr/lib/android-sdk
+          [ -d "$SDK_DIR" ] || SDK_DIR="$ANDROID_HOME"
+          echo "java=$JAVA_DIR sdk=$SDK_DIR"
+          cat > "$HOME/.config/godot/editor_settings-4.4.tres" <<EOF
           [gd_resource type="EditorSettings" format=3]
 
           [resource]
-          export/android/android_sdk_path = "/usr/lib/android-sdk"
-          export/android/java_sdk_path = "/usr/lib/jvm/java-17-openjdk-amd64"
+          export/android/android_sdk_path = "$SDK_DIR"
+          export/android/java_sdk_path = "$JAVA_DIR"
           export/android/debug_keystore = "/root/debug.keystore"
           export/android/debug_keystore_user = "androiddebugkey"
           export/android/debug_keystore_pass = "android"
           EOF
 
       - name: Install Android build template
+        shell: bash
         run: |
+          set -eE
+          trap 'echo "::error::template install failed at: $BASH_COMMAND"' ERR
           cd game
           mkdir -p android/build
-          unzip -q -o ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable/android_source.zip -d android/build
+          unzip -q -o "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable/android_source.zip" -d android/build
           echo "${GODOT_VERSION}.stable" > android/.build_version
           touch android/build/.gdignore
 
       - name: Import project and export APK
+        shell: bash
         run: |
           cd game
-          godot --headless --import || true
-          godot --headless --export-debug "Android" build/GorillaFlat.apk
+          godot --headless --import > /tmp/import.log 2>&1 || true
+          if ! godot --headless --export-debug "Android" build/GorillaFlat.apk > /tmp/export.log 2>&1; then
+            echo "::error::$(tail -30 /tmp/export.log | sed ':a;N;$!ba;s/\n/%0A/g' | cut -c1-3500)"
+            echo "::error::import: $(tail -8 /tmp/import.log | sed ':a;N;$!ba;s/\n/%0A/g' | cut -c1-1500)"
+            exit 1
+          fi
           ls -la build
 
       - name: Upload APK
