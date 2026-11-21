@@ -30,9 +30,6 @@ jobs:
           [display]
           window/vsync/vsync_mode=0
 
-          [editor_plugins]
-          enabled=PackedStringArray("res://addons/godotopenxrvendors/plugin.cfg")
-
           [physics]
           common/physics_ticks_per_second=72
 
@@ -251,29 +248,14 @@ jobs:
           EOF
 
       - name: Add OpenXR vendors plugin (Quest / Android XR support)
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          set -x
+          set -ex
           cd game
+          wget -q -O /tmp/vendors.zip https://github.com/GodotVR/godot_openxr_vendors/releases/download/4.3.1-stable/godotopenxrvendorsaddon.zip
           mkdir -p /tmp/vendors addons
-          curl -sf -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/GodotVR/godot_openxr_vendors/releases/latest -o /tmp/rel.json
-          grep -o 'https[^"]*\.zip' /tmp/rel.json | sort -u > /tmp/urls.txt
-          cat /tmp/urls.txt
-          i=0
-          while read -r URL; do
-            i=$((i+1))
-            curl -sfL "$URL" -o /tmp/v$i.zip || continue
-            rm -rf /tmp/vendors/*
-            unzip -q -o /tmp/v$i.zip -d /tmp/vendors || continue
-            SRC=$(find /tmp/vendors -type d -name godotopenxrvendors | head -1)
-            if [ -n "$SRC" ]; then
-              cp -r "$SRC" addons/
-              break
-            fi
-          done < /tmp/urls.txt
-          ls addons
-          test -d addons/godotopenxrvendors
+          unzip -q -o /tmp/vendors.zip -d /tmp/vendors
+          cp -r /tmp/vendors/asset/addons/godotopenxrvendors addons/
+          ls addons/godotopenxrvendors
 
       - name: Set up Godot, Android SDK and debug keystore
         run: |
