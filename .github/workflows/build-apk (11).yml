@@ -1,0 +1,2077 @@
+# Place at .github/workflows/build-apk.yml
+# Generates a complete Godot 4.3 multiplayer VR project (Gorilla-Tag style locomotion)
+# on the runner with cat << 'EOF' blocks, then exports an Android (Quest / OpenXR) APK.
+name: Build Forest Gorilla Tag APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  GODOT_BASE_URL: https://github.com/godotengine/godot/releases/download/4.3-stable
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install Android SDK packages
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_SDK=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "build-tools;34.0.0" "platforms;android-34" "cmake;3.10.2.4988404" "ndk;23.2.8568313"
+      - name: Download Godot 4.3 and headless export templates
+        run: |
+          set -e
+          cd "$RUNNER_TEMP"
+          wget -q "$GODOT_BASE_URL/Godot_v4.3-stable_linux.x86_64.zip"
+          wget -q "$GODOT_BASE_URL/Godot_v4.3-stable_export_templates.tpz"
+          unzip -q Godot_v4.3-stable_linux.x86_64.zip
+          sudo mv Godot_v4.3-stable_linux.x86_64 /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          mkdir -p ~/.local/share/godot/export_templates/4.3.stable
+          unzip -q Godot_v4.3-stable_export_templates.tpz -d tpl
+          mv tpl/templates/* ~/.local/share/godot/export_templates/4.3.stable/
+          godot --version
+      - name: Create debug keystore and Godot editor settings
+        run: |
+          set -e
+          KS="$HOME/debug.keystore"
+          keytool -genkey -v -keystore "$KS" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p ~/.config/godot
+          for f in editor_settings-4.3.tres editor_settings-4.tres; do
+            cat << EOF > ~/.config/godot/$f
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$ANDROID_SDK"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          export/android/debug_keystore = "$KS"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          EOF
+          done
+      - name: Write project.godot and export_presets.cfg
+        run: |
+          set -e
+          mkdir -p game
+          cat << 'EOF' > game/project.godot
+          ; Engine configuration file.
+          config_version=5
+
+          [application]
+
+          config/name="Forest Gorilla Tag"
+          run/main_scene="res://scenes/Main.tscn"
+          config/features=PackedStringArray("4.3", "Mobile")
+
+          [audio]
+
+          driver/enable_input=true
+
+          [autoload]
+
+          Net="*res://scripts/Net.gd"
+          Voice="*res://scripts/Voice.gd"
+
+          [display]
+
+          window/vsync/vsync_mode=0
+
+          [layer_names]
+
+          3d_physics/layer_1="world"
+          3d_physics/layer_2="creatures"
+
+          [physics]
+
+          common/physics_ticks_per_second=72
+
+          [rendering]
+
+          renderer/rendering_method="mobile"
+          renderer/rendering_method.mobile="mobile"
+          textures/vram_compression/import_etc2_astc=true
+          anti_aliasing/quality/msaa_3d=1
+
+          [xr]
+
+          openxr/enabled=true
+          shaders/enabled=true
+          EOF
+          cat << 'EOF' > game/export_presets.cfg
+          [preset.0]
+
+          name="Quest"
+          platform="Android"
+          runnable=true
+          advanced_options=false
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          export_path="build/ForestGorillaTag.apk"
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          encrypt_pck=false
+          encrypt_directory=false
+          script_export_mode=2
+
+          [preset.0.options]
+
+          custom_template/debug=""
+          custom_template/release=""
+          gradle_build/use_gradle_build=true
+          gradle_build/export_format=0
+          gradle_build/min_sdk="29"
+          gradle_build/target_sdk="34"
+          architectures/armeabi-v7a=false
+          architectures/arm64-v8a=true
+          architectures/x86=false
+          architectures/x86_64=false
+          version/code=1
+          version/name="1.0"
+          package/unique_name="com.example.forestgorillatag"
+          package/name="Forest Gorilla Tag"
+          package/signed=true
+          package/app_category=2
+          package/retain_data_on_uninstall=false
+          package/exclude_from_recents=false
+          package/show_in_app_library=true
+          package/show_as_launcher_app=false
+          graphics/opengl_debug=false
+          xr_features/xr_mode=1
+          xr_features/enable_meta_plugin=true
+          meta_xr_features/quest_support=2
+          screen/immersive_mode=true
+          user_data_backup/allow=false
+          permissions/record_audio=true
+          permissions/internet=true
+          permissions/access_network_state=true
+          permissions/access_wifi_state=true
+          permissions/change_wifi_multicast_state=true
+          EOF
+      - name: Write GDScript files
+        run: |
+          set -e
+          mkdir -p game/scripts
+          cat << 'EOF' > game/scripts/Net.gd
+          extends Node
+          # Networking autoload: ENet + 6-character room codes + LAN discovery.
+
+          signal players_changed
+          signal status(msg: String)
+          signal join_failed
+          signal game_start
+          signal player_left(pid: int)
+
+          enum Mode { COOP, EVIL }
+
+          const PORT := 24566
+          const DISC_PORT := 24565
+          const MAX_PLAYERS := 5
+          const MIN_PLAYERS := 2
+          const ALPHABET := "ABCDEFGHJKLMNPQR"
+
+          var mode: int = Mode.COOP
+          var room_code := ""
+          var is_host := false
+          var in_game := false
+          var players: Dictionary = {}
+
+          var _listen: PacketPeerUDP = null
+          var _find: PacketPeerUDP = null
+          var _finding := false
+          var _find_code := ""
+          var _find_t := 0.0
+          var _find_elapsed := 0.0
+
+
+          func _ready() -> void:
+              multiplayer.peer_connected.connect(_on_peer_connected)
+              multiplayer.peer_disconnected.connect(_on_peer_disconnected)
+              multiplayer.connected_to_server.connect(_on_connected)
+              multiplayer.connection_failed.connect(_on_conn_failed)
+              multiplayer.server_disconnected.connect(_on_server_lost)
+              var xr := XRServer.find_interface("OpenXR")
+              if xr != null and xr.is_initialized():
+                  get_viewport().use_xr = true
+                  DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+
+
+          func _make_code() -> String:
+              var s := ""
+              for i in 6:
+                  s += ALPHABET[randi() % ALPHABET.length()]
+              return s
+
+
+          func host_game(m: int) -> void:
+              _reset()
+              mode = m
+              room_code = _make_code()
+              var peer := ENetMultiplayerPeer.new()
+              var err := peer.create_server(PORT, MAX_PLAYERS - 1)
+              if err != OK:
+                  status.emit("Could not host (error %d)" % err)
+                  return
+              multiplayer.multiplayer_peer = peer
+              is_host = true
+              players = {1: {"name": "Host"}}
+              _listen = PacketPeerUDP.new()
+              if _listen.bind(DISC_PORT) != OK:
+                  status.emit("LAN discovery unavailable")
+              else:
+                  status.emit("Hosting room " + room_code)
+              players_changed.emit()
+
+
+          func join_game(code: String) -> void:
+              _reset()
+              _find_code = code.to_upper()
+              room_code = _find_code
+              _find = PacketPeerUDP.new()
+              _find.set_broadcast_enabled(true)
+              for i in 8:
+                  if _find.bind(30000 + randi() % 30000) == OK:
+                      break
+              _finding = true
+              _find_t = 0.0
+              _find_elapsed = 0.0
+              status.emit("Searching for room " + _find_code + "...")
+
+
+          func _targets() -> Array:
+              var t: Array = ["255.255.255.255"]
+              for a in IP.get_local_addresses():
+                  var s := str(a)
+                  var parts := s.split(".")
+                  if parts.size() == 4 and not s.begins_with("127.") and not s.begins_with("169."):
+                      t.append("%s.%s.%s.255" % [parts[0], parts[1], parts[2]])
+              return t
+
+
+          func _process(delta: float) -> void:
+              if _listen != null:
+                  while _listen.get_available_packet_count() > 0:
+                      var msg := _listen.get_packet().get_string_from_utf8()
+                      var ip := _listen.get_packet_ip()
+                      var port := _listen.get_packet_port()
+                      if msg == "FGT?" + room_code and not in_game:
+                          _listen.set_dest_address(ip, port)
+                          _listen.put_packet(("FGT!%d" % mode).to_utf8_buffer())
+              if _finding and _find != null:
+                  _find_elapsed += delta
+                  _find_t -= delta
+                  if _find_t <= 0.0:
+                      _find_t = 0.8
+                      for t in _targets():
+                          _find.set_dest_address(t, DISC_PORT)
+                          _find.put_packet(("FGT?" + _find_code).to_utf8_buffer())
+                  while _find.get_available_packet_count() > 0:
+                      var m := _find.get_packet().get_string_from_utf8()
+                      var host_ip := _find.get_packet_ip()
+                      if m.begins_with("FGT!"):
+                          _finding = false
+                          mode = int(m.substr(4))
+                          _connect_to(host_ip)
+                          return
+                  if _find_elapsed > 15.0:
+                      _finding = false
+                      status.emit("Room not found")
+                      join_failed.emit()
+
+
+          func _connect_to(ip: String) -> void:
+              if _find != null:
+                  _find.close()
+                  _find = null
+              var peer := ENetMultiplayerPeer.new()
+              var err := peer.create_client(ip, PORT)
+              if err != OK:
+                  status.emit("Connect failed (%d)" % err)
+                  join_failed.emit()
+                  return
+              multiplayer.multiplayer_peer = peer
+              status.emit("Found room, connecting...")
+
+
+          func _stop_listen() -> void:
+              if _listen != null:
+                  _listen.close()
+                  _listen = null
+
+
+          func _reset() -> void:
+              _finding = false
+              if _find != null:
+                  _find.close()
+                  _find = null
+              _stop_listen()
+              if multiplayer.multiplayer_peer != null:
+                  multiplayer.multiplayer_peer.close()
+              multiplayer.multiplayer_peer = null
+              players = {}
+              is_host = false
+              in_game = false
+              room_code = ""
+
+
+          func leave() -> void:
+              _reset()
+
+
+          func _on_peer_connected(_id: int) -> void:
+              pass
+
+
+          func _on_peer_disconnected(id: int) -> void:
+              if multiplayer.is_server() and players.has(id):
+                  players.erase(id)
+                  _push_players()
+
+
+          func _on_connected() -> void:
+              register.rpc_id(1)
+
+
+          func _on_conn_failed() -> void:
+              status.emit("Connection failed")
+              _reset()
+              join_failed.emit()
+
+
+          func _on_server_lost() -> void:
+              _reset()
+              get_tree().change_scene_to_file("res://scenes/Main.tscn")
+
+
+          @rpc("any_peer", "reliable")
+          func register() -> void:
+              if not multiplayer.is_server():
+                  return
+              var id := multiplayer.get_remote_sender_id()
+              players[id] = {"name": "Monkey %d" % (id % 100)}
+              _push_players()
+
+
+          func _push_players() -> void:
+              set_players.rpc(players, mode, room_code)
+
+
+          @rpc("authority", "call_local", "reliable")
+          func set_players(p: Dictionary, m: int, code: String) -> void:
+              var old: Array = players.keys()
+              players = p
+              mode = m
+              room_code = code
+              for k in old:
+                  if not players.has(k):
+                      player_left.emit(k)
+              players_changed.emit()
+
+
+          func start_game() -> void:
+              if not multiplayer.is_server():
+                  return
+              if players.size() < MIN_PLAYERS:
+                  status.emit("Need %d players to start" % MIN_PLAYERS)
+                  return
+              in_game = true
+              _stop_listen()
+              multiplayer.multiplayer_peer.refuse_new_connections = true
+              _begin.rpc()
+
+
+          @rpc("authority", "call_local", "reliable")
+          func _begin() -> void:
+              in_game = true
+              game_start.emit()
+          EOF
+          cat << 'EOF' > game/scripts/Voice.gd
+          extends Node
+          # Microphone loudness via AudioEffectCapture.
+
+          const SCREAM := 0.6
+          const GAIN := 1.0
+
+          var level := 0.0
+
+          var _cap: AudioEffectCapture
+          var _player: AudioStreamPlayer
+
+
+          func _ready() -> void:
+              var idx := AudioServer.bus_count
+              AudioServer.add_bus(idx)
+              AudioServer.set_bus_name(idx, "Mic")
+              _cap = AudioEffectCapture.new()
+              AudioServer.add_bus_effect(idx, _cap)
+              AudioServer.set_bus_mute(idx, true)
+              _player = AudioStreamPlayer.new()
+              _player.stream = AudioStreamMicrophone.new()
+              _player.bus = "Mic"
+              add_child(_player)
+              if OS.get_name() == "Android":
+                  get_tree().on_request_permissions_result.connect(_on_perm)
+                  OS.request_permissions()
+              _player.play()
+
+
+          func _on_perm(_permission: String, granted: bool) -> void:
+              if granted:
+                  _player.stop()
+                  _player.play()
+
+
+          func _process(delta: float) -> void:
+              var peak := 0.0
+              var frames := _cap.get_frames_available()
+              if frames > 0:
+                  var buf := _cap.get_buffer(frames)
+                  for v in buf:
+                      var a: float = maxf(absf(v.x), absf(v.y))
+                      if a > peak:
+                          peak = a
+              peak = clampf(peak * GAIN, 0.0, 1.0)
+              level = maxf(peak, level - delta * 2.0)
+          EOF
+          cat << 'EOF' > game/scripts/Main.gd
+          extends Node3D
+          # Menu / lobby. All buttons are 3D and are pressed by poking them with a hand.
+
+          const KEYS := "ABCDEFGHJKLMNPQR"
+
+          var ui: Node3D
+          var info: Label3D
+          var buttons: Array = []
+          var held: Dictionary = {}
+          var cool := 0.5
+          var screen := "main"
+          var code_in := ""
+          var code_label: Label3D = null
+          var lobby_label: Label3D = null
+
+          @onready var lh: XRController3D = $Rig/Left
+          @onready var rh: XRController3D = $Rig/Right
+
+
+          func _ready() -> void:
+              ui = Node3D.new()
+              ui.position = Vector3(0, 1.25, -0.9)
+              add_child(ui)
+              info = Label3D.new()
+              info.font_size = 36
+              info.pixel_size = 0.0012
+              info.position = Vector3(0, 0.72, -0.9)
+              add_child(info)
+              Net.status.connect(_on_status)
+              Net.players_changed.connect(_on_players)
+              Net.game_start.connect(_on_start)
+              Net.join_failed.connect(_on_join_failed)
+              _show_main()
+
+
+          func _on_status(m: String) -> void:
+              info.text = m
+
+
+          func _on_players() -> void:
+              if screen == "wait" or screen == "lobby":
+                  _show_lobby()
+
+
+          func _on_start() -> void:
+              get_tree().change_scene_to_file("res://scenes/World.tscn")
+
+
+          func _on_join_failed() -> void:
+              if screen == "wait":
+                  _show_join()
+
+
+          func _clear() -> void:
+              for c in ui.get_children():
+                  c.queue_free()
+              buttons.clear()
+              held.clear()
+              cool = 0.6
+              code_label = null
+              lobby_label = null
+
+
+          func _label(text: String, pos: Vector2, fsize: int = 48) -> Label3D:
+              var l := Label3D.new()
+              l.text = text
+              l.font_size = fsize
+              l.pixel_size = 0.0015
+              l.position = Vector3(pos.x, pos.y, 0.0)
+              ui.add_child(l)
+              return l
+
+
+          func _button(id: String, text: String, pos: Vector2, size := Vector2(0.5, 0.14), col := Color(0.15, 0.45, 0.9)) -> void:
+              var b := Node3D.new()
+              b.position = Vector3(pos.x, pos.y, 0.0)
+              var mi := MeshInstance3D.new()
+              var bm := BoxMesh.new()
+              bm.size = Vector3(size.x, size.y, 0.04)
+              mi.mesh = bm
+              var m := StandardMaterial3D.new()
+              m.albedo_color = col
+              mi.material_override = m
+              b.add_child(mi)
+              var l := Label3D.new()
+              l.text = text
+              l.font_size = 40
+              l.pixel_size = 0.0012
+              l.position = Vector3(0, 0, 0.025)
+              b.add_child(l)
+              b.set_meta("id", id)
+              b.set_meta("size", size)
+              ui.add_child(b)
+              buttons.append(b)
+
+
+          func _show_main() -> void:
+              screen = "main"
+              _clear()
+              _label("FOREST GORILLA TAG", Vector2(0, 0.5), 64)
+              _button("host_coop", "HOST CO-OP", Vector2(0, 0.25))
+              _button("host_evil", "HOST EVIL MRBEAST", Vector2(0, 0.05), Vector2(0.7, 0.14), Color(0.8, 0.2, 0.2))
+              _button("join", "JOIN ROOM", Vector2(0, -0.15))
+
+
+          func _show_join() -> void:
+              screen = "join"
+              _clear()
+              code_in = ""
+              code_label = _label("______", Vector2(0, 0.62), 72)
+              for i in KEYS.length():
+                  var cx := (i % 4) * 0.28 - 0.42
+                  var cy := 0.42 - floorf(i / 4.0) * 0.17
+                  _button("k_" + KEYS[i], KEYS[i], Vector2(cx, cy), Vector2(0.24, 0.14))
+              _button("del", "DEL", Vector2(-0.3, -0.3), Vector2(0.28, 0.14), Color(0.8, 0.45, 0.1))
+              _button("go", "JOIN", Vector2(0.03, -0.3), Vector2(0.28, 0.14), Color(0.1, 0.6, 0.2))
+              _button("back", "BACK", Vector2(0.36, -0.3), Vector2(0.28, 0.14), Color(0.5, 0.5, 0.5))
+
+
+          func _show_wait() -> void:
+              screen = "wait"
+              _clear()
+              _label("Searching for room\n" + code_in + "\n(same Wi-Fi as host)", Vector2(0, 0.3), 48)
+              _button("back", "CANCEL", Vector2(0, -0.2), Vector2(0.5, 0.14), Color(0.5, 0.5, 0.5))
+
+
+          func _show_lobby() -> void:
+              screen = "lobby"
+              _clear()
+              var s := "ROOM CODE:  %s\nMODE: %s\nPLAYERS %d/%d\n" % [Net.room_code, "CO-OP" if Net.mode == Net.Mode.COOP else "EVIL MRBEAST", Net.players.size(), Net.MAX_PLAYERS]
+              for pid in Net.players:
+                  s += "- " + str(Net.players[pid]["name"]) + "\n"
+              lobby_label = _label(s, Vector2(0, 0.25), 48)
+              if Net.is_host:
+                  _button("start", "START GAME", Vector2(0, -0.3), Vector2(0.6, 0.15), Color(0.1, 0.6, 0.2))
+              _button("back", "LEAVE", Vector2(0, -0.5), Vector2(0.4, 0.14), Color(0.5, 0.5, 0.5))
+
+
+          func _process(dt: float) -> void:
+              cool -= dt
+              for h in [lh, rh]:
+                  var hp: Vector3 = h.global_position
+                  for b in buttons:
+                      var lp: Vector3 = b.to_local(hp)
+                      var sz: Vector2 = b.get_meta("size")
+                      var inside := absf(lp.x) < sz.x * 0.5 and absf(lp.y) < sz.y * 0.5 and absf(lp.z) < 0.08
+                      var key := "%d_%d" % [h.get_instance_id(), b.get_instance_id()]
+                      if inside:
+                          if not held.get(key, false):
+                              held[key] = true
+                              if cool <= 0.0:
+                                  h.trigger_haptic_pulse("haptic", 0.0, 0.6, 0.08, 0.0)
+                                  _press(str(b.get_meta("id")))
+                                  return
+                      else:
+                          held[key] = false
+
+
+          func _press(id: String) -> void:
+              if id.begins_with("k_"):
+                  if code_in.length() < 6:
+                      code_in += id.substr(2)
+                      _update_code()
+                  return
+              match id:
+                  "host_coop":
+                      Net.host_game(Net.Mode.COOP)
+                      if Net.is_host:
+                          _show_lobby()
+                  "host_evil":
+                      Net.host_game(Net.Mode.EVIL)
+                      if Net.is_host:
+                          _show_lobby()
+                  "join":
+                      _show_join()
+                  "del":
+                      if code_in.length() > 0:
+                          code_in = code_in.substr(0, code_in.length() - 1)
+                          _update_code()
+                  "go":
+                      if code_in.length() == 6:
+                          var c := code_in
+                          _show_wait()
+                          code_in = c
+                          Net.join_game(c)
+                      else:
+                          info.text = "Enter all 6 letters"
+                  "start":
+                      Net.start_game()
+                  "back":
+                      Net.leave()
+                      info.text = ""
+                      _show_main()
+
+
+          func _update_code() -> void:
+              if code_label != null:
+                  code_label.text = code_in + "_".repeat(6 - code_in.length())
+          EOF
+          cat << 'EOF' > game/scripts/Map.gd
+          extends Node3D
+          # Forest clearing: ring of trees, boulders. Deterministic so all peers match.
+
+          const TreeScene := preload("res://scenes/Tree.tscn")
+
+          var spawn_points: Array = []
+          var rng := RandomNumberGenerator.new()
+
+
+          func _ready() -> void:
+              rng.seed = 7
+              var n := 22
+              for i in n:
+                  var a := TAU * float(i) / float(n) + rng.randf_range(-0.08, 0.08)
+                  var r := rng.randf_range(20.0, 24.0)
+                  var t: Node3D = TreeScene.instantiate()
+                  t.position = Vector3(cos(a) * r, 0.0, sin(a) * r)
+                  t.rotation.y = rng.randf() * TAU
+                  add_child(t)
+                  var inward := Vector3(-cos(a), 0.0, -sin(a))
+                  spawn_points.append(t.position + inward * 1.8)
+              for i in 16:
+                  var a2 := TAU * float(i) / 16.0 + 0.2
+                  var t2: Node3D = TreeScene.instantiate()
+                  t2.position = Vector3(cos(a2) * 27.0, 0.0, sin(a2) * 27.0)
+                  add_child(t2)
+              for i in 6:
+                  var a3 := TAU * float(i) / 6.0 + rng.randf_range(-0.3, 0.3)
+                  var r3 := rng.randf_range(10.0, 15.0)
+                  var t3: Node3D = TreeScene.instantiate()
+                  t3.position = Vector3(cos(a3) * r3, 0.0, sin(a3) * r3)
+                  add_child(t3)
+              for i in 10:
+                  var a4 := rng.randf() * TAU
+                  var r4 := rng.randf_range(5.0, 16.0)
+                  var sz := Vector3(rng.randf_range(0.8, 2.2), rng.randf_range(0.6, 2.0), rng.randf_range(0.8, 2.2))
+                  _boulder(Vector3(cos(a4) * r4, sz.y * 0.5, sin(a4) * r4), sz)
+
+
+          func _boulder(pos: Vector3, sz: Vector3) -> void:
+              var body := StaticBody3D.new()
+              body.position = pos
+              var mi := MeshInstance3D.new()
+              var bm := BoxMesh.new()
+              bm.size = sz
+              mi.mesh = bm
+              var m := StandardMaterial3D.new()
+              m.albedo_color = Color(0.45, 0.45, 0.48)
+              mi.material_override = m
+              body.add_child(mi)
+              var cs := CollisionShape3D.new()
+              var bs := BoxShape3D.new()
+              bs.size = sz
+              cs.shape = bs
+              body.add_child(cs)
+              add_child(body)
+
+
+          func player_spawn(i: int) -> Vector3:
+              var a := TAU * float(i) / 5.0
+              return Vector3(cos(a) * 3.0, 0.1, sin(a) * 3.0)
+          EOF
+          cat << 'EOF' > game/scripts/Blaster.gd
+          extends Node3D
+
+          var world = null
+          var cd := 0.0
+
+          @onready var muzzle: Node3D = $Muzzle
+
+
+          func _process(dt: float) -> void:
+              cd -= dt
+
+
+          func fire() -> void:
+              if cd > 0.0 or world == null:
+                  return
+              cd = 0.22
+              world.player_shot(muzzle.global_position, -muzzle.global_transform.basis.z)
+          EOF
+          cat << 'EOF' > game/scripts/Trap.gd
+          extends Node3D
+
+          var age := 0.0
+
+
+          func _process(dt: float) -> void:
+              age += dt
+              if age > 25.0:
+                  queue_free()
+          EOF
+          cat << 'EOF' > game/scripts/Avatar.gd
+          extends Node3D
+          # Remote player visual.
+
+          var t_head := Vector3.ZERO
+          var t_q := Quaternion.IDENTITY
+          var t_l := Vector3.ZERO
+          var t_r := Vector3.ZERO
+          var fresh := false
+          var body_scale := 1.0
+          var mat := StandardMaterial3D.new()
+
+          @onready var head: Node3D = $Head
+          @onready var body: Node3D = $Body
+          @onready var lh: Node3D = $LHand
+          @onready var rh: Node3D = $RHand
+          @onready var gun: Node3D = $RHand/Gun
+          @onready var tag: Label3D = $Tag
+
+
+          func setup(nm: String, pid: int) -> void:
+              mat.albedo_color = Color.from_hsv(float(pid % 7) / 7.0, 0.55, 0.85)
+              for n in [head, body, lh, rh]:
+                  n.material_override = mat
+              tag.text = nm
+
+
+          func apply(h: Vector3, q: Quaternion, l: Vector3, r: Vector3) -> void:
+              if not fresh:
+                  fresh = true
+                  head.global_position = h
+                  lh.global_position = l
+                  rh.global_position = r
+              t_head = h
+              t_q = q
+              t_l = l
+              t_r = r
+
+
+          func set_role(r: String) -> void:
+              var beast := r == "beast"
+              gun.visible = not beast
+              body_scale = 1.7 if beast else 1.0
+              if beast:
+                  mat.albedo_color = Color(0.9, 0.2, 0.1)
+                  tag.text = "MR BEAST"
+
+
+          func _process(dt: float) -> void:
+              if not fresh:
+                  return
+              var k := minf(1.0, dt * 18.0)
+              var cur := head.global_transform
+              var nq := cur.basis.get_rotation_quaternion().slerp(t_q, k)
+              head.global_transform = Transform3D(Basis(nq), cur.origin.lerp(t_head, k))
+              lh.global_position = lh.global_position.lerp(t_l, k)
+              rh.global_position = rh.global_position.lerp(t_r, k)
+              var yaw := Basis(t_q).get_euler().y
+              var bb := Basis(Vector3.UP, yaw).scaled(Vector3.ONE * body_scale)
+              body.global_transform = Transform3D(bb, head.global_position - Vector3(0, 0.55 * body_scale, 0))
+              tag.global_position = head.global_position + Vector3(0, 0.35, 0)
+          EOF
+          cat << 'EOF' > game/scripts/Gorilla.gd
+          extends CharacterBody3D
+          # Host runs think(); clients treat gorillas as puppets.
+
+          var gid := 0
+          var puppet := false
+          var hp := 3
+          var frozen_t := 0.0
+          var atk_cd := 0.5
+          var speed := 3.2
+          var net_pos := Vector3.ZERO
+          var net_yaw := 0.0
+          var dead := false
+          var mat := StandardMaterial3D.new()
+
+          @onready var vis: Node3D = $Visual
+
+
+          func _ready() -> void:
+              mat.albedo_color = Color(0.13, 0.12, 0.14)
+              for c in vis.get_children():
+                  if c is MeshInstance3D:
+                      c.material_override = mat
+              net_pos = global_position
+              vis.scale = Vector3.ONE * 0.05
+              create_tween().tween_property(vis, "scale", Vector3.ONE, 0.6)
+
+
+          func _frost(f: bool) -> void:
+              mat.albedo_color = Color(0.45, 0.8, 1.0) if f else Color(0.13, 0.12, 0.14)
+
+
+          func set_net(p: Vector3, yaw: float, fr: bool) -> void:
+              net_pos = p
+              net_yaw = yaw
+              _frost(fr)
+
+
+          func think(dt: float, target: Vector3, has_target: bool) -> bool:
+              atk_cd -= dt
+              var hit := false
+              if frozen_t > 0.0:
+                  frozen_t -= dt
+                  velocity.x = 0.0
+                  velocity.z = 0.0
+              elif has_target:
+                  var d := target - global_position
+                  d.y = 0.0
+                  var dist := d.length()
+                  if dist > 1.5:
+                      var dir := d / dist
+                      velocity.x = dir.x * speed
+                      velocity.z = dir.z * speed
+                  else:
+                      velocity.x = 0.0
+                      velocity.z = 0.0
+                      if atk_cd <= 0.0:
+                          atk_cd = 1.2
+                          hit = true
+                  if dist > 0.2:
+                      rotation.y = lerp_angle(rotation.y, atan2(-d.x, -d.z), minf(1.0, dt * 8.0))
+              else:
+                  velocity.x = 0.0
+                  velocity.z = 0.0
+              if is_on_floor():
+                  velocity.y = -1.0
+              else:
+                  velocity.y -= 20.0 * dt
+              move_and_slide()
+              _frost(frozen_t > 0.0)
+              return hit
+
+
+          func _process(dt: float) -> void:
+              if puppet and not dead:
+                  var k := minf(1.0, dt * 12.0)
+                  global_position = global_position.lerp(net_pos, k)
+                  rotation.y = lerp_angle(rotation.y, net_yaw, k)
+
+
+          func die() -> void:
+              dead = true
+              collision_layer = 0
+              remove_from_group("gorilla")
+              var tw := create_tween()
+              tw.tween_property(vis, "scale", Vector3.ONE * 0.05, 0.3)
+              tw.tween_callback(queue_free)
+          EOF
+          cat << 'EOF' > game/scripts/Player.gd
+          extends CharacterBody3D
+          # Gorilla-Tag style locomotion: a swept capsule body that follows the head.
+          # When a hand touches geometry (layers 1 and 2) the body is pushed opposite
+          # to the hand's movement, and keeps that velocity when you let go.
+
+          const HAND_R := 0.075
+          const MAX_SPEED := 9.0
+          const GRAV := 9.8
+          const BOOST := 1.1
+
+          var world = null
+          var down := false
+          var vel := Vector3.ZERO
+          var prev: Array = [Vector3.ZERO, Vector3.ZERO]
+          var prev_ok := false
+          var hand_shape := SphereShape3D.new()
+          var cap := CapsuleShape3D.new()
+          var hands: Array = []
+          var laser: MeshInstance3D
+          var marker: MeshInstance3D
+          var aim_hit := Vector3.ZERO
+          var aim_ok := false
+
+          @onready var origin: XROrigin3D = $Origin
+          @onready var cam: XRCamera3D = $Origin/Cam
+          @onready var hud: Label3D = $Origin/Cam/Hud
+          @onready var aim: XRController3D = $Origin/Aim
+          @onready var blaster = $Origin/Aim/Blaster
+          @onready var shape: CollisionShape3D = $Shape
+
+
+          func _unshaded(c: Color) -> StandardMaterial3D:
+              var m := StandardMaterial3D.new()
+              m.albedo_color = c
+              m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+              return m
+
+
+          func _ready() -> void:
+              hand_shape.radius = HAND_R
+              cap.radius = 0.25
+              cap.height = 1.7
+              shape.shape = cap
+              hands = [$Origin/Left, $Origin/Right]
+              blaster.world = world
+              $Origin/Aim.button_pressed.connect(_aim_btn)
+              $Origin/Left.button_pressed.connect(_left_btn)
+              laser = MeshInstance3D.new()
+              var lm := BoxMesh.new()
+              lm.size = Vector3(0.01, 0.01, 1.0)
+              laser.mesh = lm
+              laser.material_override = _unshaded(Color(1, 0.1, 0.1))
+              aim.add_child(laser)
+              marker = MeshInstance3D.new()
+              var sm := SphereMesh.new()
+              sm.radius = 0.15
+              sm.height = 0.3
+              marker.mesh = sm
+              marker.material_override = _unshaded(Color(1, 0.2, 0.2))
+              marker.top_level = true
+              add_child(marker)
+              laser.visible = false
+              marker.visible = false
+
+
+          func get_hand_pos(i: int) -> Vector3:
+              return hands[i].global_position
+
+
+          func teleport(p: Vector3) -> void:
+              global_position = p
+              vel = Vector3.ZERO
+              prev_ok = false
+
+
+          func set_down(d: bool, p: Vector3) -> void:
+              down = d
+              teleport(p)
+
+
+          func _aim_btn(n: String) -> void:
+              if down or world == null or n != "trigger_click":
+                  return
+              if world.my_role() == "beast":
+                  if aim_ok:
+                      world.request_beast("gorilla", aim_hit)
+              else:
+                  blaster.fire()
+
+
+          func _left_btn(n: String) -> void:
+              if down or world == null or n != "trigger_click":
+                  return
+              if world.my_role() == "beast" and aim_ok:
+                  world.request_beast("trap", aim_hit)
+
+
+          func _process(_dt: float) -> void:
+              if world == null:
+                  return
+              var role: String = world.my_role()
+              blaster.visible = role == "monkey" and not down
+              laser.visible = role == "beast" and not down
+              marker.visible = laser.visible and aim_ok
+              hud.text = world.hud_text()
+
+
+          func _fit_capsule() -> void:
+              var cp := cam.position
+              var hgt := clampf(cp.y + 0.1, 0.55, 2.2)
+              cap.height = hgt
+              shape.position = Vector3(cp.x, hgt * 0.5, cp.z)
+
+
+          func _touch(space: PhysicsDirectSpaceState3D, pos: Vector3) -> bool:
+              var q := PhysicsShapeQueryParameters3D.new()
+              q.shape = hand_shape
+              q.transform = Transform3D(Basis.IDENTITY, pos)
+              q.collision_mask = 3
+              return space.intersect_shape(q, 1).size() > 0
+
+
+          func _update_aim() -> void:
+              if world == null or down or world.my_role() != "beast":
+                  aim_ok = false
+                  return
+              var o := aim.global_position
+              var d := -aim.global_transform.basis.z
+              var q := PhysicsRayQueryParameters3D.create(o, o + d * 40.0, 1)
+              var r := get_world_3d().direct_space_state.intersect_ray(q)
+              var dist := 40.0
+              if r.is_empty():
+                  aim_ok = false
+              else:
+                  aim_ok = true
+                  aim_hit = r["position"]
+                  dist = o.distance_to(aim_hit)
+                  marker.global_position = aim_hit
+              var bm: BoxMesh = laser.mesh
+              bm.size = Vector3(0.01, 0.01, dist)
+              laser.position = Vector3(0, 0, -dist * 0.5)
+
+
+          func _physics_process(dt: float) -> void:
+              _fit_capsule()
+              _update_aim()
+              if down:
+                  prev_ok = false
+                  return
+              var space := get_world_3d().direct_space_state
+              var push := Vector3.ZERO
+              var touching := 0
+              for i in 2:
+                  var h: XRController3D = hands[i]
+                  var hp: Vector3 = h.position
+                  var pv: Vector3 = prev[i]
+                  if prev_ok:
+                      if _touch(space, h.global_position):
+                          var wd: Vector3 = origin.global_transform.basis * (hp - pv)
+                          if wd.length() > 0.0005:
+                              push -= wd
+                          touching += 1
+                  prev[i] = hp
+              prev_ok = true
+              if touching > 0:
+                  vel = (push / float(touching) / dt) * BOOST
+                  vel = vel.limit_length(MAX_SPEED)
+              else:
+                  vel.y -= GRAV * dt
+                  vel = vel.limit_length(MAX_SPEED * 1.6)
+              var col := move_and_collide(vel * dt)
+              if col != null:
+                  var n := col.get_normal()
+                  vel = vel.slide(n)
+                  var rest := col.get_remainder().slide(n)
+                  if rest.length() > 0.0001:
+                      move_and_collide(rest)
+                  if n.y > 0.7 and touching == 0:
+                      vel.x = move_toward(vel.x, 0.0, 10.0 * dt)
+                      vel.z = move_toward(vel.z, 0.0, 10.0 * dt)
+              if global_position.y < -10.0:
+                  teleport(Vector3(0, 1, 0))
+          EOF
+          cat << 'EOF' > game/scripts/World.gd
+          extends Node3D
+          # Game session. The host is authoritative for gorillas, damage, roles and win conditions.
+
+          const PlayerScene := preload("res://scenes/Player.tscn")
+          const AvatarScene := preload("res://scenes/Avatar.tscn")
+          const GorillaScene := preload("res://scenes/Gorilla.tscn")
+          const TrapScene := preload("res://scenes/Trap.tscn")
+
+          const KILLS_TO_WIN := 25
+          const EVIL_TIME := 180.0
+          const READY_TIME := 5.0
+          const CONTEST_TIME := 6.0
+          const SCREAM_COOLDOWN := 5.0
+          const FREEZE_TIME := 2.0
+          const PLAYER_HP := 100.0
+          const RESPAWN_TIME := 5.0
+
+          @onready var map = $Map
+          @onready var players_root: Node3D = $Players
+          @onready var gorillas_root: Node3D = $Gorillas
+          @onready var traps_root: Node3D = $Traps
+
+          var local = null
+          var avatars: Dictionary = {}
+          var gor: Dictionary = {}
+          var heads: Dictionary = {}
+          var hps: Dictionary = {}
+          var alive: Dictionary = {}
+          var roles: Dictionary = {}
+          var spawn_idx: Dictionary = {}
+          var respawn_t: Dictionary = {}
+          var contest_peak: Dictionary = {}
+          var beast_cd: Dictionary = {"gorilla": 0.0, "trap": 0.0}
+
+          var phase := "ready"
+          var phase_time := READY_TIME
+          var kills := 0
+          var result := ""
+          var event_text := ""
+          var event_n := 0
+          var seen_event := 0
+          var hud_msg := ""
+          var hud_msg_t := 0.0
+          var next_gid := 1
+          var spawn_timer := 2.0
+          var pose_t := 0.0
+          var gsync_t := 0.0
+          var state_t := 0.0
+          var scream_cd := 0.0
+          var my_peak := 0.0
+          var loud_t := 0.0
+          var ending := false
+
+
+          func _ready() -> void:
+              var me := multiplayer.get_unique_id()
+              var ids: Array = Net.players.keys()
+              ids.sort()
+              for i in ids.size():
+                  var pid: int = ids[i]
+                  spawn_idx[pid] = i
+                  hps[pid] = PLAYER_HP
+                  alive[pid] = true
+                  roles[pid] = "monkey"
+                  if pid == me:
+                      local = PlayerScene.instantiate()
+                      local.world = self
+                      players_root.add_child(local)
+                      local.teleport(map.player_spawn(i))
+                  else:
+                      var a: Node3D = AvatarScene.instantiate()
+                      players_root.add_child(a)
+                      a.setup(str(Net.players[pid]["name"]), pid)
+                      avatars[pid] = a
+              Net.player_left.connect(_on_left)
+
+
+          func _on_left(pid: int) -> void:
+              if avatars.has(pid):
+                  avatars[pid].queue_free()
+                  avatars.erase(pid)
+              alive[pid] = false
+              heads.erase(pid)
+
+
+          func my_role() -> String:
+              return str(roles.get(multiplayer.get_unique_id(), "monkey"))
+
+
+          func _pname(pid: int) -> String:
+              if Net.players.has(pid):
+                  return str(Net.players[pid]["name"])
+              return "?"
+
+
+          # ------------------------------------------------------------------ local frame
+          func _process(dt: float) -> void:
+              if local == null:
+                  return
+              var me := multiplayer.get_unique_id()
+              hud_msg_t -= dt
+              scream_cd -= dt
+
+              pose_t -= dt
+              if pose_t <= 0.0:
+                  pose_t = 0.05
+                  var cam: Node3D = local.cam
+                  var h := cam.global_position
+                  heads[me] = h
+                  pose.rpc(h, cam.global_transform.basis.get_rotation_quaternion(), local.get_hand_pos(0), local.get_hand_pos(1))
+
+              if phase == "contest":
+                  my_peak = maxf(my_peak, Voice.level)
+                  loud_t -= dt
+                  if loud_t <= 0.0:
+                      loud_t = 0.2
+                      if multiplayer.is_server():
+                          contest_peak[me] = maxf(contest_peak.get(me, 0.0), my_peak)
+                      else:
+                          report_loud.rpc_id(1, my_peak)
+              elif phase == "play" and my_role() == "monkey" and alive.get(me, true):
+                  if Voice.level > Voice.SCREAM and scream_cd <= 0.0:
+                      scream_cd = SCREAM_COOLDOWN
+                      if multiplayer.is_server():
+                          _freeze(me)
+                      else:
+                          scream.rpc_id(1)
+
+
+          func hud_text() -> String:
+              var me := multiplayer.get_unique_id()
+              var role := my_role()
+              var s := ""
+              if role == "beast":
+                  s += "MRBEAST\n"
+              else:
+                  s += "MONKEY   HP " + str(int(hps.get(me, PLAYER_HP))) + "\n"
+              if not alive.get(me, true):
+                  s += "DOWN - spectating\n"
+              match phase:
+                  "ready":
+                      s += "Get ready... " + str(int(ceil(phase_time)))
+                  "contest":
+                      s += "SCREAM TO BE MRBEAST!  " + str(int(ceil(phase_time)))
+                  "play":
+                      if Net.mode == Net.Mode.COOP:
+                          s += "Gorillas defeated: %d / %d" % [kills, KILLS_TO_WIN]
+                      else:
+                          s += "Survive: " + str(int(ceil(maxf(phase_time, 0.0)))) + "s"
+                      if role == "beast":
+                          s += "\nR-trigger: gorilla   L-trigger: trap"
+                      else:
+                          s += "\nR-trigger: shoot   SCREAM: freeze"
+                  "over":
+                      s += result
+              if hud_msg_t > 0.0:
+                  s += "\n" + hud_msg
+              s += "\nMIC " + str(int(Voice.level * 100.0)) + "%"
+              return s
+
+
+          # ------------------------------------------------------------------ pose / state sync
+          @rpc("any_peer", "unreliable_ordered")
+          func pose(h: Vector3, q: Quaternion, l: Vector3, r: Vector3) -> void:
+              var s := multiplayer.get_remote_sender_id()
+              heads[s] = h
+              if avatars.has(s):
+                  avatars[s].apply(h, q, l, r)
+
+
+          @rpc("authority", "unreliable")
+          func sync_state(st: Dictionary) -> void:
+              phase = st["ph"]
+              phase_time = st["t"]
+              kills = st["k"]
+              hps = st["hps"]
+              result = st["res"]
+              var nr: Dictionary = st["roles"]
+              if nr.hash() != roles.hash():
+                  roles = nr
+                  _apply_roles()
+              if st["evn"] != seen_event:
+                  seen_event = st["evn"]
+                  hud_msg = st["ev"]
+                  hud_msg_t = 4.0
+
+
+          @rpc("authority", "unreliable")
+          func sync_gorillas(arr: PackedFloat32Array) -> void:
+              var i := 0
+              while i + 5 < arr.size():
+                  var id := int(arr[i])
+                  if gor.has(id):
+                      gor[id].set_net(Vector3(arr[i + 1], arr[i + 2], arr[i + 3]), arr[i + 4], arr[i + 5] > 0.5)
+                  i += 6
+
+
+          func _apply_roles() -> void:
+              for pid in avatars:
+                  avatars[pid].set_role(str(roles.get(pid, "monkey")))
+
+
+          func _event(text: String) -> void:
+              event_text = text
+              event_n += 1
+              seen_event = event_n
+              hud_msg = text
+              hud_msg_t = 4.0
+
+
+          # ------------------------------------------------------------------ host simulation
+          func _set_phase(p: String, t: float) -> void:
+              phase = p
+              phase_time = t
+
+
+          func _physics_process(dt: float) -> void:
+              if not multiplayer.is_server() or ending:
+                  return
+              for k in beast_cd:
+                  beast_cd[k] = maxf(0.0, beast_cd[k] - dt)
+              match phase:
+                  "ready":
+                      phase_time -= dt
+                      if phase_time <= 0.0:
+                          if Net.mode == Net.Mode.COOP:
+                              _set_phase("play", 0.0)
+                              _event("Defend the clearing! Scream to freeze gorillas!")
+                          else:
+                              _set_phase("contest", CONTEST_TIME)
+                              _event("SCREAM! The loudest player becomes MrBeast!")
+                  "contest":
+                      phase_time -= dt
+                      if phase_time <= 0.0:
+                          _end_contest()
+                  "play":
+                      _host_play(dt)
+                  "over":
+                      phase_time -= dt
+                      if phase_time <= 0.0:
+                          ending = true
+                          to_menu.rpc()
+              state_t -= dt
+              if state_t <= 0.0:
+                  state_t = 0.1
+                  sync_state.rpc({"ph": phase, "t": phase_time, "k": kills, "roles": roles, "hps": hps, "res": result, "ev": event_text, "evn": event_n})
+              gsync_t -= dt
+              if gsync_t <= 0.0:
+                  gsync_t = 0.05
+                  if gor.size() > 0:
+                      var arr := PackedFloat32Array()
+                      for id in gor:
+                          var g = gor[id]
+                          arr.append(float(id))
+                          arr.append(g.global_position.x)
+                          arr.append(g.global_position.y)
+                          arr.append(g.global_position.z)
+                          arr.append(g.rotation.y)
+                          arr.append(1.0 if g.frozen_t > 0.0 else 0.0)
+                      sync_gorillas.rpc(arr)
+
+
+          func _end_contest() -> void:
+              var ids: Array = Net.players.keys()
+              var best: int = ids[0]
+              var bv := -1.0
+              for pid in ids:
+                  roles[pid] = "monkey"
+                  var v: float = contest_peak.get(pid, 0.0)
+                  if v > bv:
+                      bv = v
+                      best = pid
+              if bv < 0.05:
+                  best = ids.pick_random()
+              roles[best] = "beast"
+              _apply_roles()
+              _event("%s is MRBEAST!" % _pname(best))
+              _set_phase("play", EVIL_TIME)
+
+
+          func _max_gor() -> int:
+              return 6 + 2 * Net.players.size()
+
+
+          func _host_play(dt: float) -> void:
+              var evil := Net.mode == Net.Mode.EVIL
+              var ids: Array = []
+              var pos: Array = []
+              var monkeys_total := 0
+              var monkeys_alive := 0
+              for pid in Net.players.keys():
+                  if str(roles.get(pid, "monkey")) != "monkey":
+                      continue
+                  monkeys_total += 1
+                  if alive.get(pid, false):
+                      monkeys_alive += 1
+                      if heads.has(pid):
+                          ids.append(pid)
+                          pos.append(heads[pid])
+              if evil:
+                  phase_time -= dt
+              else:
+                  spawn_timer -= dt
+                  if spawn_timer <= 0.0:
+                      spawn_timer = maxf(1.2, 4.0 - float(kills) * 0.1)
+                      if gor.size() < _max_gor():
+                          _spawn_at(map.spawn_points.pick_random())
+
+              for id in gor.keys():
+                  var g = gor[id]
+                  var best := -1
+                  var bd := 1e9
+                  for i in ids.size():
+                      var p: Vector3 = pos[i]
+                      var d := Vector2(p.x - g.global_position.x, p.z - g.global_position.z).length()
+                      if d < bd:
+                          bd = d
+                          best = i
+                  var tp := Vector3.ZERO
+                  var ok := false
+                  if best >= 0:
+                      tp = pos[best]
+                      ok = tp.y < 3.8
+                  if g.think(dt, tp, ok):
+                      _damage(ids[best], 12.0)
+
+              for t in traps_root.get_children():
+                  for i in ids.size():
+                      var p2: Vector3 = pos[i]
+                      if Vector2(p2.x - t.global_position.x, p2.z - t.global_position.z).length() < 0.9 and p2.y < 2.0:
+                          _damage(ids[i], 20.0 * dt)
+
+              for pid in respawn_t.keys():
+                  respawn_t[pid] -= dt
+                  if respawn_t[pid] <= 0.0:
+                      respawn_t.erase(pid)
+                      if Net.players.has(pid):
+                          hps[pid] = PLAYER_HP
+                          set_down.rpc(pid, false, map.player_spawn(spawn_idx[pid]))
+
+              if evil:
+                  if monkeys_total > 0 and monkeys_alive == 0:
+                      _end("MRBEAST WINS! All monkeys eliminated.")
+                  elif phase_time <= 0.0:
+                      _end("MONKEYS WIN! You survived MrBeast.")
+              else:
+                  if kills >= KILLS_TO_WIN:
+                      _end("MONKEYS WIN! %d gorillas defeated." % kills)
+                  elif monkeys_total > 0 and monkeys_alive == 0:
+                      _end("GORILLAS WIN! The monkeys fell.")
+
+
+          func _end(text: String) -> void:
+              result = text
+              _event(text)
+              _set_phase("over", 8.0)
+
+
+          func _damage(pid: int, amt: float) -> void:
+              if phase != "play" or not alive.get(pid, false):
+                  return
+              hps[pid] = maxf(0.0, float(hps[pid]) - amt)
+              if hps[pid] <= 0.0:
+                  alive[pid] = false
+                  set_down.rpc(pid, true, Vector3(0, 10, 0))
+                  if Net.mode == Net.Mode.COOP:
+                      respawn_t[pid] = RESPAWN_TIME
+                  _event("%s was downed!" % _pname(pid))
+
+
+          func _spawn_at(p: Vector3) -> void:
+              var id := next_gid
+              next_gid += 1
+              spawn_gorilla.rpc(id, p)
+
+
+          func _nearest_spawn(p: Vector3) -> Vector3:
+              var best: Vector3 = map.spawn_points[0]
+              for s in map.spawn_points:
+                  if s.distance_to(p) < best.distance_to(p):
+                      best = s
+              return best
+
+
+          func _freeze(pid: int) -> void:
+              for id in gor:
+                  gor[id].frozen_t = FREEZE_TIME
+              _event("%s SCREAMED! Gorillas frozen!" % _pname(pid))
+
+
+          # ------------------------------------------------------------------ RPCs: gorillas / traps / players
+          @rpc("authority", "call_local", "reliable")
+          func spawn_gorilla(id: int, p: Vector3) -> void:
+              var g = GorillaScene.instantiate()
+              g.gid = id
+              g.puppet = not multiplayer.is_server()
+              g.position = p
+              gorillas_root.add_child(g)
+              gor[id] = g
+
+
+          @rpc("authority", "call_local", "reliable")
+          func remove_gorilla(id: int) -> void:
+              if gor.has(id):
+                  gor[id].die()
+                  gor.erase(id)
+
+
+          @rpc("authority", "call_local", "reliable")
+          func spawn_trap(p: Vector3) -> void:
+              var t: Node3D = TrapScene.instantiate()
+              t.position = p
+              traps_root.add_child(t)
+
+
+          @rpc("authority", "call_local", "reliable")
+          func set_down(pid: int, d: bool, p: Vector3) -> void:
+              alive[pid] = not d
+              if pid == multiplayer.get_unique_id():
+                  if local != null:
+                      local.set_down(d, p)
+              elif avatars.has(pid):
+                  avatars[pid].visible = not d
+
+
+          @rpc("authority", "call_local", "reliable")
+          func to_menu() -> void:
+              if multiplayer.is_server():
+                  await get_tree().create_timer(1.0).timeout
+              Net.leave()
+              get_tree().change_scene_to_file("res://scenes/Main.tscn")
+
+
+          @rpc("any_peer", "unreliable")
+          func report_loud(v: float) -> void:
+              if not multiplayer.is_server():
+                  return
+              var s := multiplayer.get_remote_sender_id()
+              contest_peak[s] = maxf(contest_peak.get(s, 0.0), v)
+
+
+          @rpc("any_peer", "reliable")
+          func scream() -> void:
+              if not multiplayer.is_server():
+                  return
+              var s := multiplayer.get_remote_sender_id()
+              if str(roles.get(s, "monkey")) == "monkey" and phase == "play":
+                  _freeze(s)
+
+
+          # ------------------------------------------------------------------ shooting
+          func player_shot(o: Vector3, d: Vector3) -> void:
+              var to := o + d * 60.0
+              var q := PhysicsRayQueryParameters3D.create(o, to, 3)
+              var r := get_world_3d().direct_space_state.intersect_ray(q)
+              var end := to
+              if not r.is_empty():
+                  end = r["position"]
+                  var c = r["collider"]
+                  if c != null and c.is_in_group("gorilla"):
+                      _request_hit(c.gid)
+              _tracer(o, end)
+              fx_shot.rpc(o, end)
+
+
+          func _request_hit(id: int) -> void:
+              if multiplayer.is_server():
+                  _do_hit(id)
+              else:
+                  hit_gorilla.rpc_id(1, id)
+
+
+          @rpc("any_peer", "reliable")
+          func hit_gorilla(id: int) -> void:
+              if multiplayer.is_server():
+                  _do_hit(id)
+
+
+          func _do_hit(id: int) -> void:
+              if phase != "play" or not gor.has(id):
+                  return
+              var g = gor[id]
+              g.hp -= 1
+              if g.hp <= 0:
+                  kills += 1
+                  remove_gorilla.rpc(id)
+
+
+          @rpc("any_peer", "unreliable")
+          func fx_shot(a: Vector3, b: Vector3) -> void:
+              _tracer(a, b)
+
+
+          func _tracer(a: Vector3, b: Vector3) -> void:
+              var dist := a.distance_to(b)
+              if dist < 0.05:
+                  return
+              var mi := MeshInstance3D.new()
+              var bm := BoxMesh.new()
+              bm.size = Vector3(0.02, 0.02, dist)
+              mi.mesh = bm
+              var m := StandardMaterial3D.new()
+              m.albedo_color = Color(1, 0.9, 0.2)
+              m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+              mi.material_override = m
+              add_child(mi)
+              mi.global_position = (a + b) * 0.5
+              var up := Vector3.UP
+              if absf((b - a).normalized().dot(up)) > 0.99:
+                  up = Vector3.RIGHT
+              mi.look_at(b, up)
+              get_tree().create_timer(0.07).timeout.connect(mi.queue_free)
+
+
+          # ------------------------------------------------------------------ evil MrBeast actions
+          func request_beast(kind: String, point: Vector3) -> void:
+              if multiplayer.is_server():
+                  _beast_do(1, kind, point)
+              else:
+                  beast_req.rpc_id(1, kind, point)
+
+
+          @rpc("any_peer", "reliable")
+          func beast_req(kind: String, point: Vector3) -> void:
+              if multiplayer.is_server():
+                  _beast_do(multiplayer.get_remote_sender_id(), kind, point)
+
+
+          func _beast_do(pid: int, kind: String, point: Vector3) -> void:
+              if phase != "play" or str(roles.get(pid, "")) != "beast":
+                  return
+              if float(beast_cd.get(kind, 1.0)) > 0.0:
+                  return
+              if kind == "gorilla":
+                  if gor.size() >= _max_gor() + 4:
+                      return
+                  beast_cd["gorilla"] = 1.0
+                  _spawn_at(_nearest_spawn(point))
+              elif kind == "trap":
+                  if traps_root.get_child_count() >= 5:
+                      return
+                  beast_cd["trap"] = 2.5
+                  spawn_trap.rpc(Vector3(point.x, 0.0, point.z))
+          EOF
+      - name: Write scene (.tscn) files
+        run: |
+          set -e
+          mkdir -p game/scenes
+          cat << 'EOF' > game/scenes/Main.tscn
+          [gd_scene format=3]
+
+          [ext_resource type="Script" path="res://scripts/Main.gd" id="1"]
+
+          [sub_resource type="Environment" id="env"]
+          background_mode = 1
+          background_color = Color(0.5, 0.7, 0.95, 1)
+          ambient_light_source = 2
+          ambient_light_color = Color(0.95, 0.95, 0.95, 1)
+          ambient_light_energy = 0.9
+
+          [sub_resource type="BoxMesh" id="floor"]
+          size = Vector3(10, 0.2, 10)
+
+          [sub_resource type="StandardMaterial3D" id="grass"]
+          albedo_color = Color(0.25, 0.55, 0.2, 1)
+
+          [sub_resource type="SphereMesh" id="tip"]
+          radius = 0.03
+          height = 0.06
+
+          [sub_resource type="StandardMaterial3D" id="red"]
+          albedo_color = Color(1, 0.2, 0.2, 1)
+
+          [node name="Main" type="Node3D"]
+          script = ExtResource("1")
+
+          [node name="Env" type="WorldEnvironment" parent="."]
+          environment = SubResource("env")
+
+          [node name="Floor" type="MeshInstance3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.1, 0)
+          mesh = SubResource("floor")
+          material_override = SubResource("grass")
+
+          [node name="Rig" type="XROrigin3D" parent="."]
+
+          [node name="Cam" type="XRCamera3D" parent="Rig"]
+
+          [node name="Left" type="XRController3D" parent="Rig"]
+          tracker = &"left_hand"
+          pose = &"grip"
+
+          [node name="Tip" type="MeshInstance3D" parent="Rig/Left"]
+          mesh = SubResource("tip")
+          material_override = SubResource("red")
+
+          [node name="Right" type="XRController3D" parent="Rig"]
+          tracker = &"right_hand"
+          pose = &"grip"
+
+          [node name="Tip" type="MeshInstance3D" parent="Rig/Right"]
+          mesh = SubResource("tip")
+          material_override = SubResource("red")
+          EOF
+          cat << 'EOF' > game/scenes/World.tscn
+          [gd_scene format=3]
+
+          [ext_resource type="Script" path="res://scripts/World.gd" id="1"]
+          [ext_resource type="PackedScene" path="res://scenes/Map.tscn" id="2"]
+
+          [node name="World" type="Node3D"]
+          script = ExtResource("1")
+
+          [node name="Map" parent="." instance=ExtResource("2")]
+
+          [node name="Players" type="Node3D" parent="."]
+
+          [node name="Gorillas" type="Node3D" parent="."]
+
+          [node name="Traps" type="Node3D" parent="."]
+          EOF
+          cat << 'EOF' > game/scenes/Map.tscn
+          [gd_scene format=3]
+
+          [ext_resource type="Script" path="res://scripts/Map.gd" id="1"]
+
+          [sub_resource type="Environment" id="env"]
+          background_mode = 1
+          background_color = Color(0.55, 0.75, 0.95, 1)
+          ambient_light_source = 2
+          ambient_light_color = Color(0.85, 0.9, 0.85, 1)
+          ambient_light_energy = 0.7
+
+          [sub_resource type="BoxMesh" id="gmesh"]
+          size = Vector3(64, 1, 64)
+
+          [sub_resource type="BoxShape3D" id="gshape"]
+          size = Vector3(64, 1, 64)
+
+          [sub_resource type="StandardMaterial3D" id="grass"]
+          albedo_color = Color(0.25, 0.55, 0.2, 1)
+
+          [sub_resource type="BoxShape3D" id="wallx"]
+          size = Vector3(1, 30, 62)
+
+          [sub_resource type="BoxShape3D" id="wallz"]
+          size = Vector3(62, 30, 1)
+
+          [node name="Map" type="Node3D"]
+          script = ExtResource("1")
+
+          [node name="Env" type="WorldEnvironment" parent="."]
+          environment = SubResource("env")
+
+          [node name="Sun" type="DirectionalLight3D" parent="."]
+          rotation_degrees = Vector3(-50, 30, 0)
+          light_energy = 0.8
+
+          [node name="Ground" type="StaticBody3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.5, 0)
+
+          [node name="Mesh" type="MeshInstance3D" parent="Ground"]
+          mesh = SubResource("gmesh")
+          material_override = SubResource("grass")
+
+          [node name="Col" type="CollisionShape3D" parent="Ground"]
+          shape = SubResource("gshape")
+
+          [node name="WallE" type="StaticBody3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 31, 15, 0)
+
+          [node name="Col" type="CollisionShape3D" parent="WallE"]
+          shape = SubResource("wallx")
+
+          [node name="WallW" type="StaticBody3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -31, 15, 0)
+
+          [node name="Col" type="CollisionShape3D" parent="WallW"]
+          shape = SubResource("wallx")
+
+          [node name="WallN" type="StaticBody3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 15, -31)
+
+          [node name="Col" type="CollisionShape3D" parent="WallN"]
+          shape = SubResource("wallz")
+
+          [node name="WallS" type="StaticBody3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 15, 31)
+
+          [node name="Col" type="CollisionShape3D" parent="WallS"]
+          shape = SubResource("wallz")
+          EOF
+          cat << 'EOF' > game/scenes/Tree.tscn
+          [gd_scene format=3]
+
+          [sub_resource type="CylinderMesh" id="trunk"]
+          top_radius = 0.35
+          bottom_radius = 0.5
+          height = 6.0
+
+          [sub_resource type="CylinderShape3D" id="trunkshape"]
+          radius = 0.5
+          height = 6.0
+
+          [sub_resource type="SphereMesh" id="leaf"]
+          radius = 2.4
+          height = 4.0
+
+          [sub_resource type="StandardMaterial3D" id="bark"]
+          albedo_color = Color(0.36, 0.24, 0.13, 1)
+
+          [sub_resource type="StandardMaterial3D" id="leafmat"]
+          albedo_color = Color(0.12, 0.45, 0.15, 1)
+
+          [node name="Tree" type="StaticBody3D" groups=["tree"]]
+
+          [node name="Col" type="CollisionShape3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 3, 0)
+          shape = SubResource("trunkshape")
+
+          [node name="Trunk" type="MeshInstance3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 3, 0)
+          mesh = SubResource("trunk")
+          material_override = SubResource("bark")
+
+          [node name="Leaves" type="MeshInstance3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 7, 0)
+          mesh = SubResource("leaf")
+          material_override = SubResource("leafmat")
+          EOF
+          cat << 'EOF' > game/scenes/Gorilla.tscn
+          [gd_scene format=3]
+
+          [ext_resource type="Script" path="res://scripts/Gorilla.gd" id="1"]
+
+          [sub_resource type="CapsuleShape3D" id="cs"]
+          radius = 0.45
+          height = 1.7
+
+          [sub_resource type="CapsuleMesh" id="torso"]
+          radius = 0.45
+          height = 1.5
+
+          [sub_resource type="SphereMesh" id="head"]
+          radius = 0.25
+          height = 0.5
+
+          [sub_resource type="CapsuleMesh" id="arm"]
+          radius = 0.13
+          height = 1.2
+
+          [node name="Gorilla" type="CharacterBody3D" groups=["gorilla"]]
+          collision_layer = 2
+          collision_mask = 1
+          script = ExtResource("1")
+
+          [node name="Col" type="CollisionShape3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.85, 0)
+          shape = SubResource("cs")
+
+          [node name="Visual" type="Node3D" parent="."]
+
+          [node name="Torso" type="MeshInstance3D" parent="Visual"]
+          transform = Transform3D(1.3, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.95, 0)
+          mesh = SubResource("torso")
+
+          [node name="Head" type="MeshInstance3D" parent="Visual"]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.7, -0.12)
+          mesh = SubResource("head")
+
+          [node name="ArmL" type="MeshInstance3D" parent="Visual"]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.7, 0.8, 0)
+          mesh = SubResource("arm")
+
+          [node name="ArmR" type="MeshInstance3D" parent="Visual"]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.7, 0.8, 0)
+          mesh = SubResource("arm")
+          EOF
+          cat << 'EOF' > game/scenes/Avatar.tscn
+          [gd_scene format=3]
+
+          [ext_resource type="Script" path="res://scripts/Avatar.gd" id="1"]
+
+          [sub_resource type="SphereMesh" id="head"]
+          radius = 0.13
+          height = 0.26
+
+          [sub_resource type="CapsuleMesh" id="body"]
+          radius = 0.17
+          height = 0.8
+
+          [sub_resource type="SphereMesh" id="hand"]
+          radius = 0.06
+          height = 0.12
+
+          [sub_resource type="BoxMesh" id="gun"]
+          size = Vector3(0.04, 0.06, 0.18)
+
+          [sub_resource type="BoxMesh" id="snout"]
+          size = Vector3(0.08, 0.05, 0.08)
+
+          [node name="Avatar" type="Node3D"]
+          script = ExtResource("1")
+
+          [node name="Head" type="MeshInstance3D" parent="."]
+          mesh = SubResource("head")
+
+          [node name="Snout" type="MeshInstance3D" parent="Head"]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.03, -0.13)
+          mesh = SubResource("snout")
+
+          [node name="Body" type="MeshInstance3D" parent="."]
+          mesh = SubResource("body")
+
+          [node name="LHand" type="MeshInstance3D" parent="."]
+          mesh = SubResource("hand")
+
+          [node name="RHand" type="MeshInstance3D" parent="."]
+          mesh = SubResource("hand")
+
+          [node name="Gun" type="MeshInstance3D" parent="RHand"]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -0.1)
+          mesh = SubResource("gun")
+
+          [node name="Tag" type="Label3D" parent="."]
+          billboard = 1
+          text = "?"
+          font_size = 48
+          pixel_size = 0.003
+          EOF
+          cat << 'EOF' > game/scenes/Blaster.tscn
+          [gd_scene format=3]
+
+          [ext_resource type="Script" path="res://scripts/Blaster.gd" id="1"]
+
+          [sub_resource type="BoxMesh" id="body"]
+          size = Vector3(0.05, 0.09, 0.2)
+
+          [sub_resource type="BoxMesh" id="barrel"]
+          size = Vector3(0.025, 0.025, 0.12)
+
+          [sub_resource type="StandardMaterial3D" id="orange"]
+          albedo_color = Color(0.95, 0.5, 0.1, 1)
+
+          [node name="Blaster" type="Node3D"]
+          script = ExtResource("1")
+
+          [node name="Body" type="MeshInstance3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.03, 0)
+          mesh = SubResource("body")
+          material_override = SubResource("orange")
+
+          [node name="Barrel" type="MeshInstance3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.01, -0.14)
+          mesh = SubResource("barrel")
+          material_override = SubResource("orange")
+
+          [node name="Muzzle" type="Marker3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.01, -0.22)
+          EOF
+          cat << 'EOF' > game/scenes/Trap.tscn
+          [gd_scene format=3]
+
+          [ext_resource type="Script" path="res://scripts/Trap.gd" id="1"]
+
+          [sub_resource type="CylinderMesh" id="spike"]
+          top_radius = 0.0
+          bottom_radius = 0.2
+          height = 0.6
+
+          [sub_resource type="StandardMaterial3D" id="red"]
+          albedo_color = Color(0.9, 0.1, 0.1, 1)
+
+          [node name="Trap" type="Node3D"]
+          script = ExtResource("1")
+
+          [node name="Spike1" type="MeshInstance3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.3, 0)
+          mesh = SubResource("spike")
+          material_override = SubResource("red")
+
+          [node name="Spike2" type="MeshInstance3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.4, 0.3, 0.2)
+          mesh = SubResource("spike")
+          material_override = SubResource("red")
+
+          [node name="Spike3" type="MeshInstance3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.4, 0.3, -0.2)
+          mesh = SubResource("spike")
+          material_override = SubResource("red")
+
+          [node name="Spike4" type="MeshInstance3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.2, 0.3, 0.4)
+          mesh = SubResource("spike")
+          material_override = SubResource("red")
+
+          [node name="Spike5" type="MeshInstance3D" parent="."]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.2, 0.3, -0.4)
+          mesh = SubResource("spike")
+          material_override = SubResource("red")
+          EOF
+          cat << 'EOF' > game/scenes/Player.tscn
+          [gd_scene format=3]
+
+          [ext_resource type="Script" path="res://scripts/Player.gd" id="1"]
+          [ext_resource type="PackedScene" path="res://scenes/Blaster.tscn" id="2"]
+
+          [sub_resource type="CapsuleShape3D" id="cap"]
+          radius = 0.25
+          height = 1.7
+
+          [sub_resource type="SphereMesh" id="hand"]
+          radius = 0.05
+          height = 0.1
+
+          [sub_resource type="StandardMaterial3D" id="skin"]
+          albedo_color = Color(0.6, 0.4, 0.25, 1)
+
+          [node name="Player" type="CharacterBody3D"]
+          collision_layer = 0
+          collision_mask = 1
+          script = ExtResource("1")
+
+          [node name="Shape" type="CollisionShape3D" parent="."]
+          shape = SubResource("cap")
+
+          [node name="Origin" type="XROrigin3D" parent="."]
+
+          [node name="Cam" type="XRCamera3D" parent="Origin"]
+
+          [node name="Hud" type="Label3D" parent="Origin/Cam"]
+          transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.3, -0.9)
+          modulate = Color(1, 1, 0.8, 1)
+          outline_size = 10
+          no_depth_test = true
+          text = "..."
+          font_size = 64
+          pixel_size = 0.0008
+
+          [node name="Left" type="XRController3D" parent="Origin"]
+          tracker = &"left_hand"
+          pose = &"grip"
+
+          [node name="Mesh" type="MeshInstance3D" parent="Origin/Left"]
+          mesh = SubResource("hand")
+          material_override = SubResource("skin")
+
+          [node name="Right" type="XRController3D" parent="Origin"]
+          tracker = &"right_hand"
+          pose = &"grip"
+
+          [node name="Mesh" type="MeshInstance3D" parent="Origin/Right"]
+          mesh = SubResource("hand")
+          material_override = SubResource("skin")
+
+          [node name="Aim" type="XRController3D" parent="Origin"]
+          tracker = &"right_hand"
+          pose = &"aim"
+
+          [node name="Blaster" parent="Origin/Aim" instance=ExtResource("2")]
+          EOF
+      - name: Install Android build template and OpenXR Vendors plugin
+        run: |
+          set -e
+          mkdir -p game/android/build
+          unzip -q -o ~/.local/share/godot/export_templates/4.3.stable/android_source.zip -d game/android/build
+          printf "4.3.stable" > game/android/.build_version
+          # Godot OpenXR Vendors plugin (Meta Quest loader + manifest entries) for Godot 4.3
+          URL=$(curl -sL https://api.github.com/repos/GodotVR/godot_openxr_vendors/releases/tags/3.0.0-stable | python3 -c "import sys,json; a=[x['browser_download_url'] for x in json.load(sys.stdin).get('assets',[]) if x['name'].endswith('.zip')]; print(a[0] if a else '')")
+          echo "Vendors plugin URL: $URL"
+          test -n "$URL"
+          curl -sL "$URL" -o "$RUNNER_TEMP/vendors.zip"
+          mkdir -p "$RUNNER_TEMP/vendors" game/addons
+          unzip -q -o "$RUNNER_TEMP/vendors.zip" -d "$RUNNER_TEMP/vendors"
+          SRC=$(find "$RUNNER_TEMP/vendors" -type d -name godotopenxrvendors | head -n 1)
+          cp -r "$SRC" game/addons/
+          ls game/addons/godotopenxrvendors
+          cat << 'EOF' >> game/project.godot
+
+          [editor_plugins]
+
+          enabled=PackedStringArray("res://addons/godotopenxrvendors/plugin.cfg")
+          EOF
+      - name: Import project and export APK
+        env:
+          GODOT_ANDROID_KEYSTORE_DEBUG_PATH: /home/runner/debug.keystore
+          GODOT_ANDROID_KEYSTORE_DEBUG_USER: androiddebugkey
+          GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD: android
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/build"
+          cd game
+          godot --headless --import || true
+          godot --headless --import || true
+          godot --headless --export-debug "Quest" "$GITHUB_WORKSPACE/build/ForestGorillaTag.apk"
+          ls -lh "$GITHUB_WORKSPACE/build"
+          test -f "$GITHUB_WORKSPACE/build/ForestGorillaTag.apk"
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ForestGorillaTag-apk
+          path: build/ForestGorillaTag.apk
+          if-no-files-found: error
